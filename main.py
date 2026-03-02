@@ -141,3 +141,14 @@ def update_agency(agency_name: str, payload: AgencyPayload):
     doc_ref.set(doc_data)
     _invalidate_cache()
     return {"message": "Agency updated", "name": payload.name}
+
+
+@app.delete("/agencies/{agency_name:path}")
+def delete_agency(agency_name: str):
+    doc_ref = db.collection("agencies").document(agency_name)
+    if not doc_ref.get().exists:
+        raise HTTPException(status_code=404, detail="Agency not found")
+
+    doc_ref.delete()
+    _invalidate_cache()
+    return {"message": "Agency deleted", "name": agency_name}
