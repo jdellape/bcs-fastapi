@@ -1,11 +1,19 @@
+import os
 import time
+import uuid
 from typing import Optional
+
 from fastapi import FastAPI, HTTPException
+from google.api_core import exceptions as google_exceptions
 from pydantic import BaseModel
+
 from firebase_client import get_firestore_client
 
 app = FastAPI()
 db = get_firestore_client()
+
+# Blair county doc in service-navigator (override per environment if needed).
+COUNTY_DOC_ID = os.environ.get("FIRESTORE_COUNTY_DOC_ID", "rYszDQ9QkU8hVUQhsSMz")
 
 
 class AgencyPayload(BaseModel):
@@ -20,6 +28,7 @@ class AgencyPayload(BaseModel):
     services_description: Optional[str] = ""
     services: list[str] = []
 
+
 CACHE_TTL_SECONDS = 3600
 
 _agency_cache = {"data": None, "timestamp": 0}
@@ -28,6 +37,14 @@ _agency_cache = {"data": None, "timestamp": 0}
 def _invalidate_cache():
     _agency_cache["data"] = None
     _agency_cache["timestamp"] = 0
+
+
+def _agencies_col():
+    return (
+        db.collection("counties")
+        .document(COUNTY_DOC_ID)
+        .collection("agencies")
+    )
 
 
 def _build_firestore_doc(payload: AgencyPayload) -> dict:
@@ -56,7 +73,7 @@ def _get_all_agencies():
         return _agency_cache["data"]
 
     agencies = []
-    for doc in db.collection("agencies").stream():
+    for doc in _agencies_col().stream():
         data = doc.to_dict()
         data["id"] = doc.id
         agencies.append(data)
@@ -66,13 +83,69 @@ def _get_all_agencies():
     return agencies
 
 
+def _name_already_used(name: str, exclude_id: Optional[str] = None) -> bool:
+    for agency in _get_all_agencies():
+        if agency.get("name") == name and (exclude_id is None or agency["id"] != exclude_id):
+            return True
+    return False
+
+
+def _handle_firestore_write_error(exc: Exception) -> None:
+    if isinstance(exc, google_exceptions.PermissionDenied):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Firestore denied this write. The configured service account needs "
+                "Cloud Datastore User (or similar) on this project. "
+                "Datastore Viewer / read-only accounts cannot create, update, or delete."
+            ),
+        ) from exc
+
+
+# Static / collection routes before /agencies/{agency_id} so paths like
+# /agencies/by-service/... are not captured as an agency id.
+
+
+@app.get("/agencies")
+def list_agencies():
+    return [
+        {"name": a["name"], "id": a["id"]}
+        for a in _get_all_agencies()
+    ]
+
+
+@app.get("/agencies/by-service/{service_name:path}")
+def get_agencies_by_service(service_name: str):
+    results = []
+    for agency in _get_all_agencies():
+        if service_name in agency.get("services", {}):
+            results.append({
+                "id": agency.get("id"),
+                "name": agency.get("name"),
+                "phone_num": agency.get("phone_num"),
+                "address_line_one": agency.get("address_line_one"),
+                "services_description": agency.get("services_description"),
+            })
+
+    return results
+
+
 @app.get("/agencies/{agency_id}")
 def get_agency(agency_id: str):
-    for agency in _get_all_agencies():
-        if agency["id"] == agency_id:
-            return agency
+    try:
+        snap = _agencies_col().document(agency_id).get()
+    except google_exceptions.PermissionDenied as e:
+        raise HTTPException(
+            status_code=403,
+            detail="Firestore denied read access. Check service account permissions.",
+        ) from e
 
-    raise HTTPException(status_code=404, detail="Agency not found")
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Agency not found")
+
+    data = snap.to_dict()
+    data["id"] = snap.id
+    return data
 
 
 @app.get("/services")
@@ -85,47 +158,37 @@ def get_all_services():
     return sorted(service_set)
 
 
-@app.get("/agencies/by-service/{service_name:path}")
-def get_agencies_by_service(service_name: str):
-    results = []
-    for agency in _get_all_agencies():
-        if service_name in agency.get("services", {}):
-            results.append({
-                "name": agency.get("name"),
-                "phone_num": agency.get("phone_num"),
-                "address_line_one": agency.get("address_line_one"),
-                "services_description": agency.get("services_description"),
-            })
-
-    return results
-
-
-@app.get("/agencies")
-def list_agencies():
-    return [
-        {"name": a["name"], "id": a["id"]}
-        for a in _get_all_agencies()
-    ]
-
-
 @app.post("/agencies", status_code=201)
 def create_agency(payload: AgencyPayload):
-    doc_ref = db.collection("agencies").document(payload.name)
-    if doc_ref.get().exists:
+    if _name_already_used(payload.name):
         raise HTTPException(status_code=409, detail="Agency already exists")
 
-    doc_ref.set(_build_firestore_doc(payload))
+    doc_id = str(uuid.uuid4())
+    doc_ref = _agencies_col().document(doc_id)
+    try:
+        doc_ref.set(_build_firestore_doc(payload))
+    except google_exceptions.PermissionDenied as e:
+        _handle_firestore_write_error(e)
+
     _invalidate_cache()
-    return {"message": "Agency created", "name": payload.name}
+    return {"message": "Agency created", "id": doc_id, "name": payload.name}
 
 
-@app.put("/agencies/{agency_name:path}")
-def update_agency(agency_name: str, payload: AgencyPayload):
-    doc_ref = db.collection("agencies").document(agency_name)
-    if not doc_ref.get().exists:
+@app.put("/agencies/{agency_id}")
+def update_agency(agency_id: str, payload: AgencyPayload):
+    doc_ref = _agencies_col().document(agency_id)
+    try:
+        snap = doc_ref.get()
+    except google_exceptions.PermissionDenied as e:
+        _handle_firestore_write_error(e)
+
+    if not snap.exists:
         raise HTTPException(status_code=404, detail="Agency not found")
 
-    existing = doc_ref.get().to_dict()
+    if _name_already_used(payload.name, exclude_id=agency_id):
+        raise HTTPException(status_code=409, detail="Another agency already uses this name")
+
+    existing = snap.to_dict() or {}
     existing_services = existing.get("services", {})
     new_services = {}
     for svc in payload.services:
@@ -138,17 +201,30 @@ def update_agency(agency_name: str, payload: AgencyPayload):
     doc_data["services"] = new_services
     doc_data["hours_of_operation"] = existing.get("hours_of_operation", [])
 
-    doc_ref.set(doc_data)
+    try:
+        doc_ref.set(doc_data)
+    except google_exceptions.PermissionDenied as e:
+        _handle_firestore_write_error(e)
+
     _invalidate_cache()
-    return {"message": "Agency updated", "name": payload.name}
+    return {"message": "Agency updated", "id": agency_id, "name": payload.name}
 
 
-@app.delete("/agencies/{agency_name:path}")
-def delete_agency(agency_name: str):
-    doc_ref = db.collection("agencies").document(agency_name)
-    if not doc_ref.get().exists:
+@app.delete("/agencies/{agency_id}")
+def delete_agency(agency_id: str):
+    doc_ref = _agencies_col().document(agency_id)
+    try:
+        snap = doc_ref.get()
+    except google_exceptions.PermissionDenied as e:
+        _handle_firestore_write_error(e)
+
+    if not snap.exists:
         raise HTTPException(status_code=404, detail="Agency not found")
 
-    doc_ref.delete()
+    try:
+        doc_ref.delete()
+    except google_exceptions.PermissionDenied as e:
+        _handle_firestore_write_error(e)
+
     _invalidate_cache()
-    return {"message": "Agency deleted", "name": agency_name}
+    return {"message": "Agency deleted", "id": agency_id}

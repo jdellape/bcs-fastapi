@@ -21,9 +21,13 @@ env/
 
 # Secrets / credentials
 streamlit-sources.json
+service-navigator-ro.json
 *service-account*.json
 *-firebase-adminsdk-*.json
 *credentials*.json
+
+# Local-only migration tooling (keep out of version control)
+migrate_agencies_firestore.py
 
 # OS / editor
 .DS_Store
