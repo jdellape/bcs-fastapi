@@ -4,6 +4,7 @@ import uuid
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from google.api_core import exceptions as google_exceptions
 from pydantic import BaseModel
 
@@ -11,6 +12,22 @@ from firebase_client import get_firestore_client
 
 app = FastAPI()
 db = get_firestore_client()
+
+# Browsers reject Access-Control-Allow-Origin: * together with credentials.
+# Default to * without credentials so localhost / Vercel can call the API.
+_cors_origins = [
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", "*").split(",")
+    if o.strip()
+]
+_allow_all_origins = _cors_origins == ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=not _allow_all_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Blair county doc in service-navigator (override per environment if needed).
 COUNTY_DOC_ID = os.environ.get("FIRESTORE_COUNTY_DOC_ID", "rYszDQ9QkU8hVUQhsSMz")
