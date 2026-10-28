@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+from datetime import date
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -44,6 +45,7 @@ class AgencyPayload(BaseModel):
     email: Optional[str] = ""
     services_description: Optional[str] = ""
     services: list[str] = []
+    last_audited_date: Optional[str] = None
 
 
 CACHE_TTL_SECONDS = 3600
@@ -64,12 +66,24 @@ def _agencies_col():
     )
 
 
+def _normalize_audit_date(value: Optional[str]) -> Optional[str]:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return date.fromisoformat(str(value).strip()).isoformat()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="last_audited_date must be YYYY-MM-DD",
+        )
+
+
 def _build_firestore_doc(payload: AgencyPayload) -> dict:
     services_dict = {}
     for svc in payload.services:
         services_dict[svc] = {"has_schedule": False}
 
-    return {
+    doc = {
         "name": payload.name,
         "address_line_one": payload.address_line_one,
         "city": payload.city,
@@ -82,6 +96,10 @@ def _build_firestore_doc(payload: AgencyPayload) -> dict:
         "services": services_dict,
         "hours_of_operation": [],
     }
+    audited = _normalize_audit_date(payload.last_audited_date)
+    if audited:
+        doc["last_audited_date"] = audited
+    return doc
 
 
 def _get_all_agencies():
@@ -217,6 +235,12 @@ def update_agency(agency_id: str, payload: AgencyPayload):
     doc_data = _build_firestore_doc(payload)
     doc_data["services"] = new_services
     doc_data["hours_of_operation"] = existing.get("hours_of_operation", [])
+
+    # Clients that omit last_audited_date (mobile manage) must not wipe a stored date.
+    if "last_audited_date" not in payload.model_fields_set:
+        existing_date = existing.get("last_audited_date")
+        if existing_date:
+            doc_data["last_audited_date"] = existing_date
 
     try:
         doc_ref.set(doc_data)
