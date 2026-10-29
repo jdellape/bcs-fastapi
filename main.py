@@ -137,8 +137,34 @@ def _handle_firestore_write_error(exc: Exception) -> None:
         ) from exc
 
 
+def _service_names(agency: dict) -> list[str]:
+    services = agency.get("services") or {}
+    if isinstance(services, dict):
+        return sorted(services.keys())
+    if isinstance(services, list):
+        return [str(s) for s in services]
+    return []
+
+
+def _agency_details(agency: dict) -> dict:
+    return {
+        "id": agency.get("id"),
+        "name": agency.get("name") or "",
+        "address_line_one": agency.get("address_line_one") or "",
+        "city": agency.get("city") or "",
+        "state_code": agency.get("state_code") or "",
+        "zip_code": agency.get("zip_code") or "",
+        "phone_num": agency.get("phone_num") or "",
+        "contact_name": agency.get("contact_name") or "",
+        "email": agency.get("email") or "",
+        "services": _service_names(agency),
+        "services_description": agency.get("services_description") or "",
+        "last_audited_date": agency.get("last_audited_date") or None,
+    }
+
+
 # Static / collection routes before /agencies/{agency_id} so paths like
-# /agencies/by-service/... are not captured as an agency id.
+# /agencies/by-service/... and /agencies/details are not captured as an agency id.
 
 
 @app.get("/agencies")
@@ -147,6 +173,15 @@ def list_agencies():
         {"name": a["name"], "id": a["id"]}
         for a in _get_all_agencies()
     ]
+
+
+@app.get("/agencies/details")
+def list_agency_details():
+    agencies = sorted(
+        _get_all_agencies(),
+        key=lambda a: (a.get("name") or "").lower(),
+    )
+    return [_agency_details(a) for a in agencies]
 
 
 @app.get("/agencies/by-service/{service_name:path}")
