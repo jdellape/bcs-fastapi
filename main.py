@@ -48,6 +48,11 @@ class AgencyPayload(BaseModel):
     last_audited_date: Optional[str] = None
 
 
+class ServiceRenamePayload(BaseModel):
+    current_name: str
+    new_name: str
+
+
 CACHE_TTL_SECONDS = 3600
 
 _agency_cache = {"data": None, "timestamp": 0}
@@ -146,6 +151,33 @@ def _service_names(agency: dict) -> list[str]:
     return []
 
 
+def _iter_service_names(services) -> list[str]:
+    if isinstance(services, dict):
+        return [name for name in services.keys() if isinstance(name, str)]
+    if isinstance(services, list):
+        return [item for item in services if isinstance(item, str)]
+    return []
+
+
+def _with_renamed_service(services, old_name: str, new_name: str):
+    """Return a copy of an agency's services with one name changed.
+
+    Dict values (including schedule data) stay attached to the renamed key.
+    Returns None when this agency does not offer the service.
+    """
+    if isinstance(services, dict):
+        if old_name not in services:
+            return None
+        updated = dict(services)
+        updated[new_name] = updated.pop(old_name)
+        return updated
+    if isinstance(services, list):
+        if old_name not in services:
+            return None
+        return [new_name if item == old_name else item for item in services]
+    return None
+
+
 def _agency_details(agency: dict) -> dict:
     return {
         "id": agency.get("id"),
@@ -222,10 +254,80 @@ def get_agency(agency_id: str):
 def get_all_services():
     service_set = set()
     for agency in _get_all_agencies():
-        services = agency.get("services", {})
-        service_set.update(services.keys())
+        service_set.update(_iter_service_names(agency.get("services")))
 
     return sorted(service_set)
+
+
+_FIRESTORE_BATCH_LIMIT = 500
+
+
+@app.post("/services/rename")
+def rename_service(payload: ServiceRenamePayload):
+    old_name = payload.current_name
+    new_name = payload.new_name.strip()
+    if not isinstance(old_name, str) or not old_name:
+        raise HTTPException(status_code=400, detail="Current service name is required")
+    if not new_name:
+        raise HTTPException(status_code=400, detail="New service name is required")
+    if new_name == old_name:
+        raise HTTPException(
+            status_code=400,
+            detail="New service name matches the current name",
+        )
+
+    try:
+        snapshots = list(_agencies_col().stream())
+    except google_exceptions.PermissionDenied as e:
+        raise HTTPException(
+            status_code=403,
+            detail="Firestore denied read access. Check service account permissions.",
+        ) from e
+
+    known_names = set()
+    pending = []
+    for snap in snapshots:
+        services = (snap.to_dict() or {}).get("services")
+        known_names.update(_iter_service_names(services))
+        renamed = _with_renamed_service(services, old_name, new_name)
+        if renamed is not None:
+            pending.append((snap.reference, renamed))
+
+    if old_name not in known_names:
+        raise HTTPException(status_code=404, detail="Service not found")
+    if new_name in known_names:
+        raise HTTPException(
+            status_code=409,
+            detail="A service with that name already exists. Choose a different name.",
+        )
+
+    updated = 0
+    wrote_any = False
+    try:
+        for start in range(0, len(pending), _FIRESTORE_BATCH_LIMIT):
+            batch = db.batch()
+            chunk = pending[start : start + _FIRESTORE_BATCH_LIMIT]
+            for ref, services in chunk:
+                batch.update(ref, {"services": services})
+            batch.commit()
+            wrote_any = True
+            updated += len(chunk)
+    except google_exceptions.PermissionDenied as e:
+        if wrote_any:
+            _invalidate_cache()
+        _handle_firestore_write_error(e)
+    except Exception:
+        if wrote_any:
+            _invalidate_cache()
+        raise
+
+    _invalidate_cache()
+    return {
+        "message": "Service renamed",
+        "current_name": old_name,
+        "new_name": new_name,
+        "agencies_updated": updated,
+    }
 
 
 @app.post("/agencies", status_code=201)
