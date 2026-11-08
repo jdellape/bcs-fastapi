@@ -1,0 +1,2 @@
+fastapi[standard]
+firebase_admin
