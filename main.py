@@ -36,10 +36,10 @@ COUNTY_DOC_ID = os.environ.get("FIRESTORE_COUNTY_DOC_ID", "rYszDQ9QkU8hVUQhsSMz"
 
 class AgencyPayload(BaseModel):
     name: str
-    address_line_one: str
+    address_line_one: Optional[str] = ""
     city: str
     zip_code: str
-    phone_num: str
+    phone_num: Optional[str] = ""
     state_code: str = "PA"
     contact_name: Optional[str] = ""
     email: Optional[str] = ""
@@ -90,14 +90,14 @@ def _build_firestore_doc(payload: AgencyPayload) -> dict:
 
     doc = {
         "name": payload.name,
-        "address_line_one": payload.address_line_one,
-        "city": payload.city,
-        "state_code": payload.state_code,
-        "zip_code": payload.zip_code,
-        "phone_num": payload.phone_num,
-        "contact_name": payload.contact_name,
-        "email": payload.email,
-        "services_description": payload.services_description,
+        "address_line_one": payload.address_line_one or "",
+        "city": payload.city or "",
+        "state_code": payload.state_code or "PA",
+        "zip_code": payload.zip_code or "",
+        "phone_num": payload.phone_num or "",
+        "contact_name": payload.contact_name or "",
+        "email": payload.email or "",
+        "services_description": payload.services_description or "",
         "services": services_dict,
         "hours_of_operation": [],
     }
